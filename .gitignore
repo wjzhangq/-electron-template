@@ -1,0 +1,42 @@
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+main.js
+utils/zip.bundle.js
+
+# Electron build
+out/
+release/
+build/
+extraResources/
+
+# Signing materials
+*.p12
+*.pem
+*.key
+*.cer
+
+# Environment
+.env
+.env.local
+.env.sh
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/

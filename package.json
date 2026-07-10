@@ -1,0 +1,114 @@
+{
+  "name": "my-electron-app",
+  "version": "1.0.0",
+  "productName": "My Electron App",
+  "homepage": "https://example.com",
+  "companyName": "Your Company Name",
+  "copyright": "Your Company Name",
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron . -url=http://localhost:3000",
+    "build:main": "rm -rf main.js; ncc build main.src.js --external electron -o main.js;",
+    "build:zip": "ncc build utils/zip.js -o dist/zip/; cp dist/zip/index.js utils/zip.bundle.js",
+    "pack:m1": "electron-builder --mac --arm64",
+    "pack:intel": "electron-builder --macos --x64",
+    "pack:win64": "electron-builder --win --x64",
+    "pack:win32": "electron-builder --win --ia32",
+    "pack:linux": "electron-builder --linux --x64",
+    "pack:linuxarm": "electron-builder --linux --arm64",
+    "grant-exec": "if [ -d 'extraResources' ]; then \n chmod -R a+x extraResources/* \n fi"
+  },
+  "author": "Your Company Name",
+  "license": "ISC",
+  "build": {
+    "artifactName": "${productName}_${arch}_${version}_unsign.${ext}",
+    "extraMetadata": {
+      "initRegion": ""
+    },
+    "asar": false,
+    "appId": "com.example.my-electron-app",
+    "productName": "My Electron App",
+    "copyright": "Your Company Name",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "icon",
+      "build",
+      "utils"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg"
+      ],
+      "icon": "./icon/app.icns",
+      "extraResources": [
+        {
+          "from": "./extraResources/darwin_${arch}/",
+          "to": "extraResources",
+          "filter": [
+            "*"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "sign": false
+    },
+    "win": {
+      "icon": "./icon/app.ico",
+      "extraResources": [
+        {
+          "from": "./extraResources/win32_${arch}/",
+          "to": "extraResources",
+          "filter": [
+            "*"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "category": "Utility",
+      "icon": "./icon/",
+      "target": [
+        "deb",
+        "AppImage",
+        "tar.xz"
+      ],
+      "extraResources": [
+        {
+          "from": "./extraResources/linux_${arch}/",
+          "to": "extraResources",
+          "filter": [
+            "*"
+          ]
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^26.0.1",
+    "@rollup/plugin-node-resolve": "^15.2.4",
+    "@vercel/ncc": "^0.38.3",
+    "adm-zip": "^0.5.14",
+    "electron": "npm:electron@^26.6.10",
+    "electron-builder": "^24.13.3",
+    "rollup": "^4.22.4",
+    "rollup-plugin-terser": "^7.0.2"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.6.3",
+    "lodash": "^4.17.21",
+    "rawheaders2obj": "^0.0.2",
+    "shell-env": "2.0.0",
+    "superagent": "^10.2.0"
+  }
+}
