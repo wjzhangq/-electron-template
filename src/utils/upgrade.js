@@ -7,12 +7,14 @@ const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
 const { exec } = require("node:child_process");
-const { downloadFile, fileExists } = require("../utils/utils");
-const { unzipAndDeleteFile } = require("../utils/zip.bundle");
+const { downloadFile, fileExists } = require("./utils");
+const { unzipAndDeleteFile } = require("./zip");
 
-const originPath = path.join(__dirname, "../build"); // Original directory
+// After esbuild bundling, this module is inlined into the root-level main.js,
+// so __dirname resolves to the repository/app root at runtime.
+const originPath = path.join(__dirname, "build"); // Original directory (root/build)
 let raw_bspatch_bin = path.join(
-  path.dirname(path.dirname(__dirname)),
+  __dirname,
   "extraResources",
   `bspatch_${os.platform()}_${os.arch()}`
 );

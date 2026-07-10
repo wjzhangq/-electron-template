@@ -16,12 +16,28 @@ A production-ready Electron shell template extracted from a mature application. 
 
 ## Directory structure
 
+Source lives in `src/`; the build (esbuild) emits bundled, minified `main.js` and
+`preload.js` to the repository root. Those root artifacts are gitignored — all
+third-party runtime dependencies are inlined into them, so `dependencies` in
+`package.json` stays empty.
+
 ```
 electron-template/
-  main.js                    # Main process — window, protocols, tray, IPC wiring
-  preload.js                 # contextBridge — window.app.* and window.versions.*
+  src/                       # ✨ Source (edit here)
+    main.js                  # Main process — window, protocols, tray, IPC wiring
+    preload.js               # contextBridge — window.app.* and window.versions.*
+    utils/
+      protocol.js            # app:// + api:// + apt:// handlers; add RPC methods here
+      ipcInit.js             # All IPC channels (safeHandle + app + window level)
+      utils.js               # Shared utilities: EventConvertResult, HttpConvertResult, PromiseQueue, etc.
+      upgrade.js             # Hot update: download → extract → write upgrade.json → restart
+      autoImportTask.js      # setInterval scheduler
+      newElectronServer.js   # IPC socket server for running local scripts
+      zip.js                 # AdmZip wrapper (source)
+  esbuild.config.mjs         # ✨ Unified build config (main + preload entries)
+  main.js                    # 🔨 Build artifact (gitignored)
+  preload.js                 # 🔨 Build artifact (gitignored)
   package.json               # Customize: name, productName, appId, version, copyright
-  rollup.config.js           # Bundle config for utils
   build3.sh                  # Multi-platform build script
   .gitignore
   icon/
@@ -31,14 +47,6 @@ electron-template/
   build/
     work.asar/
       index.html             # Placeholder frontend — replace with your bundle
-  utils/
-    protocol.js              # app:// + api:// + apt:// handlers; add RPC methods here
-    ipcInit.js               # All IPC channels (safeHandle + app + window level)
-    utils.js                 # Shared utilities: EventConvertResult, HttpConvertResult, PromiseQueue, etc.
-    upgrade.js               # Hot update: download → extract → write upgrade.json → restart
-    autoImportTask.js        # setInterval scheduler
-    newElectronServer.js     # IPC socket server for running local scripts
-    zip.js                   # AdmZip wrapper (source)
   extraResources/            # Place bspatch binaries here for hot update diff patches
     darwin_x64/
     darwin_arm64/
@@ -47,6 +55,25 @@ electron-template/
     linux_x64/
     linux_arm64/
 ```
+
+## Build commands
+
+| Command | What it does |
+|---------|--------------|
+| `npm run build` | Production build — bundles + minifies `src/main.js` and `src/preload.js` to root |
+| `npm run build:dev` | Dev build — no minification, with sourcemaps |
+| `npm run watch` | Watch mode — incremental rebuild on source change |
+| `npm run dev` | `build:dev` then launch `electron .` |
+
+> **Note**: `shell-env` is an ESM-only package, so you cannot run `electron src/main.js`
+> directly (CommonJS cannot `require` ESM). Development always runs the esbuild
+> artifact, which transpiles ESM → CJS. For a fast edit loop, run `npm run watch`
+> in one terminal and `electron .` in another, pressing Cmd/Ctrl+R to reload after
+> each rebuild.
+>
+> The build must run after `npm install` (with devDependencies present) — the bundled
+> libraries are build-time only. A `npm ci --omit=dev` environment cannot build, but it
+> can run an already-built artifact.
 
 ## Getting started
 
@@ -62,16 +89,19 @@ npm install
 # 4. Put your frontend build into build/work.asar/
 #    (or develop with npm start which loads from localhost:3000)
 
-# 5. Run in dev mode
+# 5. Run in dev mode (builds src/ then launches electron)
 npm run dev
 
-# 6. Package
+# 6. Build production artifacts
+npm run build
+
+# 7. Package
 ./build3.sh -p mac -a arm
 ```
 
 ## Adding apt:// RPC methods
 
-Edit `utils/protocol.js` and add handlers to the `handlers` object inside `aptHandler`:
+Edit `src/utils/protocol.js` and add handlers to the `handlers` object inside `aptHandler`:
 
 ```js
 // JSON response
@@ -92,7 +122,7 @@ handlers['myStream'] = async (buf, stream) => {
 };
 ```
 
-**Helper functions** (from `utils/utils.js`):
+**Helper functions** (from `src/utils/utils.js`):
 - `EventConvertResult(data, event)` — formats SSE frame: `event: xxx\ndata: ...\n\n`
 - `HttpConvertResult(data)` — formats JSON response: `{code, msg, data}`
   - String with `@code` suffix → `{code, msg}` (e.g. `"not found@404"`)
@@ -137,9 +167,9 @@ The service must accept `POST multipart/form-data` with `file=@<path>` and retur
 | What | Where |
 |------|-------|
 | App name / appId / version | `package.json` → `name`, `productName`, `appId`, `version` |
-| Tray tooltip | `main.js` → `createTray()` → `tray.setToolTip(...)` |
-| Window min size | `main.js` → `createWindow()` → `minWidth`, `minHeight` |
-| RPC methods | `utils/protocol.js` → `handlers` object |
-| userData subdirectory | `utils/ipcInit.js` → `openFolder` handler |
+| Tray tooltip | `src/main.js` → `createTray()` → `tray.setToolTip(...)` |
+| Window min size | `src/main.js` → `createWindow()` → `minWidth`, `minHeight` |
+| RPC methods | `src/utils/protocol.js` → `handlers` object |
+| userData subdirectory | `src/utils/ipcInit.js` → `openFolder` handler |
 | Supported locales | `build3.sh` → `validate_lang()` + `-l` flag |
-| Script runner languages | `utils/newElectronServer.js` → `langCommandMap` |
+| Script runner languages | `src/utils/newElectronServer.js` → `langCommandMap` |

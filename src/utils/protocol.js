@@ -1,8 +1,8 @@
 const { Readable } = require("stream");
 const path = require("node:path");
-const { getBuildPath } = require("../utils/upgrade");
+const { getBuildPath } = require("./upgrade");
 const BuildPath = getBuildPath();
-const utils = require("../utils/utils");
+const utils = require("./utils");
 const EventConvertResult = utils.EventConvertResult;
 const HttpConvertResult = utils.HttpConvertResult;
 

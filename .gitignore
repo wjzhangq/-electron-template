@@ -11,9 +11,11 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Build artifacts
-main.js
-utils/zip.bundle.js
+# Build artifacts (esbuild output at repo root — anchored so src/ is not ignored)
+/main.js
+/main.js.map
+/preload.js
+/preload.js.map
 
 # Electron build
 out/

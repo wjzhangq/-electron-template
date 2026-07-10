@@ -7,10 +7,11 @@
   "copyright": "Your Company Name",
   "main": "main.js",
   "scripts": {
-    "dev": "electron .",
-    "start": "electron . -url=http://localhost:3000",
-    "build:main": "rm -rf main.js; ncc build main.src.js --external electron -o main.js;",
-    "build:zip": "ncc build utils/zip.js -o dist/zip/; cp dist/zip/index.js utils/zip.bundle.js",
+    "build": "node esbuild.config.mjs",
+    "build:dev": "node esbuild.config.mjs --dev",
+    "watch": "node esbuild.config.mjs --watch",
+    "dev": "npm run build:dev && electron .",
+    "start": "npm run build && electron . -url=http://localhost:3000",
     "pack:m1": "electron-builder --mac --arm64",
     "pack:intel": "electron-builder --macos --x64",
     "pack:win64": "electron-builder --win --x64",
@@ -37,8 +38,7 @@
       "main.js",
       "preload.js",
       "icon",
-      "build",
-      "utils"
+      "build"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
@@ -95,20 +95,13 @@
     }
   },
   "devDependencies": {
-    "@rollup/plugin-commonjs": "^26.0.1",
-    "@rollup/plugin-node-resolve": "^15.2.4",
-    "@vercel/ncc": "^0.38.3",
     "adm-zip": "^0.5.14",
     "electron": "npm:electron@^26.6.10",
     "electron-builder": "^24.13.3",
-    "rollup": "^4.22.4",
-    "rollup-plugin-terser": "^7.0.2"
-  },
-  "dependencies": {
+    "esbuild": "^0.28.1",
     "iconv-lite": "^0.6.3",
     "lodash": "^4.17.21",
-    "rawheaders2obj": "^0.0.2",
-    "shell-env": "2.0.0",
-    "superagent": "^10.2.0"
-  }
+    "shell-env": "2.0.0"
+  },
+  "dependencies": {}
 }
