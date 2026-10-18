@@ -1,344 +1,356 @@
-# Electron Template 项目分析
-
-> 本文档整理自仓库源码（`src/`、`esbuild.config.mjs`、`build3.sh`、`package.json`、`specs/`），用于快速了解项目的结构、运行机制、对外接口与已知问题。
-
----
-
-## 1. 项目概览
+# PRD：Electron 壳模板重构（TypeScript + chttp 虚拟 HTTP 服务）
 
 | 项 | 内容 |
 |----|------|
-| 定位 | 从成熟产品中抽离出的 **Electron 壳模板**：壳层负责窗口、协议、IPC、热更新、打包；业务前端以 `work.asar` 形式加载 |
-| 运行时 | Electron `^26.6.10`（Node 18） |
-| 语言 | 纯 JavaScript（CommonJS），无 TypeScript |
-| 构建 | esbuild（`src/` → 根目录 `main.js` / `preload.js`，第三方依赖全部内联） |
-| 打包 | electron-builder `^24.13.3` + 自定义多平台脚本 `build3.sh` |
-| 运行时依赖 | **无**（`dependencies: {}`），lodash / iconv-lite / shell-env / adm-zip 均为 devDependencies，构建时打包进产物 |
-| 研发流程 | 使用 Spec Kit（`.specify/`、`specs/001-optimize-build-bundle/`）管理需求 → 方案 → 任务 |
-| 代码规模 | `src/` 约 2.2k 行；`build3.sh` 约 280 行 |
-
-Git 历史：
-
-1. `8293ff1` 初始化项目与 `.gitignore`
-2. `5a18a63` 用 esbuild 替代 rollup + ncc，依赖内联，源码迁入 `src/`
+| 文档状态 | 草案 v1，**第 10 节待确认事项关闭后**可进入开发 |
+| 适用分支 | `claude/bold-dirac-yzc19u` |
+| 上一版 | 原 pro.md 为现状代码分析，见 git 历史 `docs: add pro.md project analysis`；本版附录 A 保留摘要 |
 
 ---
 
-## 2. 目录结构
+## 1. 背景
 
-```
--electron-template/
-├── src/                          # 源码（日常编辑这里）
-│   ├── main.js                   # 主进程入口：窗口、协议注册、托盘、单实例、快捷键
-│   ├── preload.js                # contextBridge：暴露 window.app.* / window.versions.*
-│   └── utils/
-│       ├── protocol.js           # app:// / api:// / apt:// 三个自定义协议处理器
-│       ├── ipcInit.js            # 应用级 + 窗口级 IPC 通道，定时检查更新
-│       ├── utils.js              # URL 工具、下载、HTTP 请求、窗口尺寸持久化、SSE/JSON 格式化等
-│       ├── upgrade.js            # 热更新：全量包 / bsdiff 增量包，版本回退保护
-│       ├── autoImportTask.js     # 基于 setInterval 的定时任务调度器
-│       ├── newElectronServer.js  # 本地 IPC Socket 服务：执行本地脚本（node/python/go/php…）
-│       └── zip.js                # adm-zip 解压并删除压缩包
-├── esbuild.config.mjs            # 统一构建配置（main + preload 两个入口）
-├── build3.sh                     # 多平台 × 多架构 × 多语言打包 + 签名脚本
-├── package.json                  # 应用元信息、scripts、electron-builder 配置
-├── icon/                         # app.icns / app.ico / app.png
-├── specs/001-optimize-build-bundle/  # 构建优化需求规格、方案、任务、备份的旧配置
-├── .specify/                     # Spec Kit 模板与脚本
-└── .gitignore                    # 忽略根目录 main.js/preload.js、build/、extraResources/、dist/ 等
-```
+### 1.1 现状
 
-运行/打包时还需要（被 gitignore，不在仓库中）：
+本仓库是从成熟产品抽离的 Electron 26 壳模板（纯 JS + esbuild + electron-builder）。主进程提供 `app://`（静态资源）、`api://`（反向代理）、`apt://`（RPC + SSE）三个协议，另有热更新、本地脚本执行服务、定时任务、跨平台打包脚本。
 
-- `build/work.asar/index.html` 等：前端产物（目录形式，非真正 asar 归档）
-- `extraResources/<platform>_<arch>/`：`bspatch` 二进制，用于增量热更新
+### 1.2 问题
+
+| # | 问题 | 影响 |
+|---|------|------|
+| P1 | Electron 26 已停止维护，`registerFileProtocol/registerStreamProtocol` 等 API 已废弃 | 无安全补丁，后续无法升级 |
+| P2 | 纯 JS，无类型、无测试、无 lint、无 CI | 维护成本高，重构风险大 |
+| P3 | 三个协议职责重叠、返回格式不统一（`{code,msg,data}` + 自定义错误码 + 字符串 `@code` 约定） | 前端调用方式混乱 |
+| P4 | 安全基线差：忽略所有证书错误、全局注入 `CORS: *`、`vm` 执行前端代码、本地脚本服务存在命令注入、preload 暴露任意 IPC 通道 | 一处 XSS 即可在用户机器执行任意命令 |
+| P5 | 热更新、增量补丁存在多处缺陷（bspatch 路径错误、`send.asar` 遗留等） | 功能实际不可靠 |
+
+### 1.3 原 pro.md 作为需求的不足
+
+原文档只描述"代码现在做什么"，缺少目标、范围、验收标准，缺陷清单也没有处置结论，不能直接指导开发。本版按"目标 → 决策 → 需求 → 验收"组织。
 
 ---
 
-## 3. 构建与运行
+## 2. 目标与非目标
 
-### 3.1 npm scripts
+### 2.1 目标
 
-| 命令 | 作用 |
+- **G1** 升级到最新稳定版 Electron，使用 Electron Forge + TypeScript 重建工程。
+- **G2** 提供统一自定义协议 `chttp://`，以"虚拟 HTTP Server"形式同时承载前端静态资源、HTTP 接口与 SSE，**不监听任何真实端口**。
+- **G3** 路由可在主进程用 TS 注册，并支持从安装包内置目录动态加载路由模块（插件）。
+- **G4** 安全基线符合 Electron 官方安全建议。
+- **G5** 仅面向 Windows x64，产出 Inno Setup 安装包，并具备代码签名能力。
+
+### 2.2 非目标（本期明确不做）
+
+| 不做 | 说明 |
 |------|------|
-| `npm run build` | 生产构建：压缩、无 sourcemap |
-| `npm run build:dev` | 开发构建：不压缩、带 sourcemap |
-| `npm run watch` | 监听增量构建（隐含 dev 模式） |
-| `npm run dev` | `build:dev` 后执行 `electron .` |
-| `npm start` | `build` 后执行 `electron . -url=http://localhost:3000`（加载本地前端 dev server） |
-| `npm run pack:{m1,intel,win64,win32,linux,linuxarm}` | 调用 electron-builder 打包对应平台 |
-| `npm run grant-exec` | 给 `extraResources/*` 加可执行权限 |
+| macOS / Linux 支持 | 代码中删除对应分支（`hiddenInset`、`Cmd+Q`、`activate` 等） |
+| Windows ia32 / arm64 | 仅 x64 |
+| 热更新（全量/增量） | 删除 `upgrade.js`、bspatch、`extraResources`；前端随安装包发布 |
+| 本地脚本执行服务 | 删除 `newElectronServer.js`、shell-env、iconv-lite |
+| `callFunction`（vm 执行）、`fetch`/`api://` 任意 URL 代理 | 删除 |
+| 按地区/语言出包（initRegion 出包） | 不做 |
+| 应用自动更新（autoUpdater） | 不做 |
+| 运行时安装第三方插件 | 插件只能随安装包发布 |
 
-### 3.2 esbuild 配置要点（`esbuild.config.mjs`）
+---
 
-- `bundle: true`、`platform: "node"`、`format: "cjs"`、`target: "node18"`
-- `external: ["electron"]`，Node 内置模块自动 external
-- 入口：`src/main.js → main.js`，`src/preload.js → preload.js`
-- 注意：`shell-env@2` 是 ESM-only，**不能直接 `electron src/main.js`**，必须走构建产物
+## 3. 已确认决策
 
-### 3.3 启动参数（`utils.getEnterPoint`）
+| # | 决策 | 结论 |
+|---|------|------|
+| D1 | Electron 版本 | 立项时的最新稳定版，锁定 major 版本 |
+| D2 | 语言 | TypeScript（`strict: true`） |
+| D3 | 工具链 | Electron Forge（构建、打包、make） |
+| D4 | 协议 | `chttp://` **统一替代** `app://`、`api://`、`apt://` |
+| D5 | URL 规划 | 单主机：`chttp://app/` 静态资源，`chttp://app/api/*` 路由 |
+| D6 | 路由来源 | 主进程 TS 注册 + 动态加载**安装包内置** `plugins/` 目录 |
+| D7 | 保留的旧功能 | 窗口、托盘、单实例、窗口控制 IPC、AutoImport 定时任务 |
+| D8 | 安全 | 移除全部不安全默认行为，遵循官方安全建议 |
+| D9 | 平台 | 仅 Windows x64 |
+| D10 | 安装包 | Inno Setup |
+| D11 | 签名 | 提供签名方案（见第 7 节） |
 
-| 参数 | 作用 |
+---
+
+## 4. 总体架构
+
+```
+┌──────────────────────────── 主进程 (TypeScript) ────────────────────────────┐
+│                                                                             │
+│  chttp 协议层  protocol.handle("chttp")                                      │
+│   ├─ /api/*            → Router ──┬─ 内置路由（src/main/routes/*.ts）         │
+│   │                               └─ 插件路由（resources/plugins/<name>/）    │
+│   │                                  挂载到 /api/plugins/<name>/*            │
+│   └─ 其他路径           → 静态资源（生产：asar 内 renderer/；开发：代理 dev server） │
+│                                                                             │
+│  窗口 / 托盘 / 单实例      IPC（白名单 + 类型契约）      AutoImport 调度器      │
+└─────────────────────────────────────────────────────────────────────────────┘
+          ▲ 白名单 IPC                                ▲ fetch / SSE
+┌──────── preload（sandbox，contextBridge）──┐   ┌──── 渲染进程 chttp://app/ ────┐
+│ window.app.*（仅窗口/系统类能力）            │   │ 业务前端（与 /api 同源）       │
+└────────────────────────────────────────────┘   └──────────────────────────────┘
+```
+
+职责边界：**数据与业务接口一律走 `chttp://app/api`**；IPC 只保留 HTTP 无法表达的窗口/系统控制和主进程推送。
+
+---
+
+## 5. 功能需求
+
+> 编号规则：`FR-<模块>-<序号>`。每条需求均需有对应自动化测试或第 9 节中的手工验收项。
+
+### 5.1 工程与构建（BLD）
+
+| 编号 | 需求 |
 |------|------|
-| `-url=<url>` | 覆盖加载地址，默认 `app://localhost` |
-| `-dev` | 自动打开 DevTools |
-| `-region=<code>` | 设置 `global.initRegion` |
+| FR-BLD-1 | 使用 Electron Forge 的 TypeScript 模板创建工程，main / preload / renderer 三个入口分别构建 |
+| FR-BLD-2 | `tsconfig` 开启 `strict`；`npm run typecheck`（`tsc --noEmit`）必须零错误 |
+| FR-BLD-3 | 提供 `start`（开发）、`package`、`make`、`lint`、`typecheck`、`test` 脚本 |
+| FR-BLD-4 | `dependencies` 为空或仅包含必须在运行时存在的包；其余依赖构建时打包 |
+| FR-BLD-5 | 启用 asar；通过 Forge Fuses 插件关闭 `RunAsNode`、`EnableNodeOptionsEnvironmentVariable`、`EnableNodeCliInspectArguments`，开启 `EnableEmbeddedAsarIntegrityValidation`、`OnlyLoadAppFromAsar` |
+| FR-BLD-6 | 删除 `esbuild.config.mjs`、`build3.sh`、electron-builder 配置及 `specs/001-*/backup` 中的旧配置 |
+| FR-BLD-7 | 提供 CI（至少执行 lint、typecheck、test、Windows 上的 `make`） |
 
-### 3.4 electron-builder 配置（`package.json → build`）
+### 5.2 chttp 协议（PRT）
 
-- `asar: false`；`files`: `main.js`、`preload.js`、`icon`、`build`
-- 产物命名：`${productName}_${arch}_${version}_unsign.${ext}`，输出 `dist/`
-- mac：`dmg`，`hiddenInset` 标题栏；win：NSIS（非一键、可选安装目录）；linux：`deb`、`AppImage`、`tar.xz`
-- 每个平台将 `extraResources/<os>_${arch}/` 拷贝到安装包的 `resources/extraResources`
-- `extraMetadata.initRegion` 用于按语言/地区出包
-
-### 3.5 `build3.sh` 打包流程
-
-```
-./build3.sh -p <win|mac|linux>... -a <x64|x32|arm>... [-l <en|ja>...] [-s]
-```
-
-1. 解析参数，生成 `平台_架构` 组合（不存在对应 `*_cmd` 的组合自动跳过，如 `mac_x32`）
-2. 用 `asar ef build/work.asar index.html` 取出前端首页，正则提取 `__APP_VERSION__` / `__BUILD_DATE__`
-3. 读取 `package.json` 的 `name` / `productName` / `version`
-4. 10 秒内需输入 `yes` 确认
-5. 对每个 语言 × 平台：`yarn pack:xxx -c.extraMetadata.version=<web版本> -c.extraMetadata.initRegion=<lang>`
-6. 产物移动到 `dist/<name>/<web版本>/[<lang>/]<productName>_<identifier>_<版本>.<ext>`
-7. `-s` 签名：
-   - mac：`xcrun notarytool submit --keychain-profile <name>` + `stapler staple`
-   - win：`curl -F file=@... $WIN_SIGN_URL`，返回文件 > 10MB 才视为成功
-   - linux：无操作
-
-> 安装包版本号取自前端 `window.__APP_VERSION__`，而不是 `package.json.version`。
-
----
-
-## 4. 运行时架构
-
-```
-┌──────────────────────────── 主进程 main.js ────────────────────────────┐
-│ 单实例锁 / crashReporter / 托盘(Win) / Cmd+Q 快捷键(mac)                │
-│                                                                        │
-│ protocol.js                 ipcInit.js               upgrade.js         │
-│  app://  静态文件 ──────────┐ ipcAppInit  (应用级)     getBuildPath     │
-│  api://  反向代理           │ ipcWindowInit(窗口级)    updateBuild      │
-│  apt://  RPC + SSE          │ checkUpdate 定时推送     bspatch 增量     │
-│                             ▼                                           │
-│                    BuildPath = userData/upgrade/build_x 或 <app>/build  │
-│                                                                        │
-│ autoImportTask.js  定时任务 → webContents.send("autoImport")           │
-│ newElectronServer.js  Unix Socket / Named Pipe → execSync 本地脚本      │
-└────────────────────────────────────────────────────────────────────────┘
-                 ▲ ipcRenderer.invoke / sendSync / on
-┌──────────── preload.js (contextBridge) ────────────┐
-│ window.versions.*      window.app.*                │
-└────────────────────────────────────────────────────┘
-                 ▲
-┌──────────── 渲染进程：build/work.asar/index.html (app://localhost) ──┐
-```
-
-### 4.1 启动顺序（`src/main.js`）
-
-1. 读取 `userData`、`appVersion`、系统主题，写入 `global`；从 `package.json` 读取 `initRegion`
-2. `require("./utils/protocol")` —— 此时 `upgrade.getBuildPath()` 已被调用，确定前端目录
-3. 追加 `max-connections-per-host=20`，启动 `crashReporter`（不上传）
-4. `protocol.registerSchemesAsPrivileged` 注册 `app/api/apt` 为特权协议
-5. `requestSingleInstanceLock`，第二实例触发时聚焦/重建主窗口
-6. `app.whenReady()`：
-   - 注册 `app`(file)、`api`(buffer)、`apt`(stream) 三个协议
-   - `initElectronServer()` 启动本地脚本服务
-   - `initRegion` 为空时使用 `app.getLocaleCountryCode()`
-   - 创建 `AutoImportTask`，`ipcAppInit`
-   - `createWindow()`；Windows 下创建托盘
-   - mac 下窗口聚焦时注册 `Cmd+Q` → 强制退出，失焦时注销
-
-### 4.2 窗口（`createWindow`）
-
-- 默认取主屏工作区尺寸；宽度 > 1800 时缩为约 50% 宽 × 80% 高；最小 960×640
-- `frame: false`；mac `hiddenInset`、win `hidden`、其他 `default`
-- 会话级钩子：
-  - `onHeadersReceived`：响应没有 CORS 头时注入 `Access-Control-Allow-Origin: *`
-  - `onBeforeRequest`：一次性重定向表 `app.RedirectMap`（命中即删除，保留原 query）
-  - `onBeforeSendHeaders`：附加 `RejectUnauthorized: false` 头
-  - `setCertificateVerifyProc(() => 0)`：**忽略所有证书错误**
-- `nativeTheme` 变化 → `send("onTheme", isDark)`
-- 恢复/保存窗口尺寸：`userData/window-size.json`
-- 关闭流程：`close` 事件中 `preventDefault`，向渲染进程发 `onClose`(关闭配置)，500ms 后若未 `cancelQuit` 则强制 `destroy`
-- `did-finish-load` 时读取并打印 `window.__APP_VERSION__` / `__BUILD_DATE__`
-- 右键菜单：全选、复制；可编辑区域额外有剪切、粘贴
-
-### 4.3 自定义协议（`src/utils/protocol.js`）
-
-| 协议 | 注册方式 | 行为 |
-|------|----------|------|
-| `app://` | `registerFileProtocol` | 映射到 `<BuildPath>/work.asar/<path>`；无扩展名回落 `index.html`（SPA 路由）；`index.html` 加 `Pragma: no-cache`；`xxx.<8位hash>.js` 设置 `ETag` |
-| `api://` | `registerBufferProtocol` | 直接用 `fetch(request.url)` 转发，响应体按文本返回 |
-| `apt://` | `registerStreamProtocol` | 按 URL 最后一段分发方法，返回 `Readable` 流，支持 SSE |
-
-`apt://` 内置方法：
-
-| 方法 | 请求 | 响应 |
-|------|------|------|
-| `fetch` | 请求头 `origin-url: <目标地址>`，其余头/方法/body 原样转发（`electron.net`） | 目标响应原样返回 |
-| `callFunction` | `POST {context, text}`，`context` 为函数体 | 在 `vm` 新上下文中执行（3s 超时）→ `{code:0,data:{text,value}}` |
-| `download` | `POST {url, filePath}` | SSE：`event: progress` … `event: complete` / `event: error` |
-
-扩展方式：在 `aptHandler` 内的 `handlers` 对象添加 `async (buf, stream) => {}`，推送数据后 `stream.push(null)` 结束；通过 `stream._is_close` 判断客户端是否断开。
-
-返回格式工具（`utils.js`）：
-
-- `HttpConvertResult(obj)` → `{"code":0,"msg":"success","data":obj}`
-- `HttpConvertResult("msg@30003")` → `{"code":30003,"msg":"msg","data":""}`；无 `@` 时 `code=10001`
-- `EventConvertResult(data, event)` → `event: <event>\ndata: <json>\n\n`
-
-错误码：`3006/3007/10001/30002/30003/30004/30005`（分别为参数缺失、方法不存在、通用错误、无返回值、执行错误、分发异常、JSON 解析失败）。
-
-### 4.4 渲染进程 API（`src/preload.js`）
-
-`window.versions`：`node()`、`chrome()`、`electron()`
-
-`window.app`：
-
-| 分类 | 方法 | 通道类型 |
-|------|------|----------|
-| 应用 | `appVersion()` → `{app, upgrade, build}`、`appQuit()`、`appRestart()`（带 `--relaunch`）、`doCrash()` | invoke |
-| 窗口 | `miniWindow`、`maxWindow`、`scaleWindow`(切换最大化)、`closeWindow`、`hideWindow`、`activeWindow`、`forceCloseWindow(cfg)`、`cancelQuit`、`openDevTools`、`toggleDevTools` | invoke（窗口级 `safeHandle`） |
-| 系统 | `openLink(url)`（仅 http/https）、`openFile(path)`（在文件夹中显示）、`install(path)`（打开安装包后退出） | invoke |
-| 路径 | `getUserDataPath`、`getTempPath`、`getDownloadsPath`、`getLogsPath`、`getCrashPath` | sendSync |
-| 信息 | `getBuildVersion`、`getShellVersion`、`getLocale`、`getRegion`、`getSystemRegion`、`getIsThemeDark`、`getArch`、`getPlatform` | sendSync / 本地 |
-| 热更新 | `hotUpdate(version, hotUrl, diffUrl)` → 空字符串表示成功，否则为错误原因 | invoke |
-| 任务 | `initAutoImport(taskList)`、`getAutoImport()` | invoke / sendSync |
-| 网络 | `getRemoteText(url, headers)`、`setRedirect(url, redirectUrl)` | invoke |
-| 消息 | `sendMessage(...args)`（任意通道 send）、`onMessage(channel, fn)` → 返回取消订阅函数 | send / on |
-
-主进程主动推送的事件（通过 `onMessage` 监听）：
-
-| 通道 | 时机 | 参数 |
-|------|------|------|
-| `onClose` | 用户点击关闭 | `{isTray, noPrompt}`（Windows 读 `close-cfg.json`，默认托盘 + 提示） |
-| `onTheme` | 系统主题变化 | `isDark` |
-| `checkUpdate` | 首次 20s 后，之后每 30~90 分钟随机 | `timeout` 秒数 |
-| `autoImport` | 定时任务触发 | `data, nextInvocation` |
-
-> `ipcAppInit` 中还注册了 `openFolder(folderName)`（打开/创建 userData 子目录），但 preload 未暴露。
-
-### 4.5 关闭行为约定
-
-1. 关闭窗口 → 主进程发 `onClose(cfg)`，并在 500ms 后强制销毁
-2. 前端若要接管（弹窗询问"最小化到托盘/退出"），需在 500ms 内调用 `cancelQuit()`
-3. 用户选择后调用 `forceCloseWindow({isTray})`：
-   - Windows：`isTray > 0` 隐藏到托盘，否则销毁并退出
-   - 其他平台：销毁窗口；`isTray < 0` 时退出应用
-
-### 4.6 热更新（`src/utils/upgrade.js`）
-
-存储结构：
-
-```
-userData/upgrade/
-├── upgrade.json          # {buildPath, buildVersion, appVersion}
-└── build_<version>/
-    ├── work.asar/…       # 新前端
-    └── send.asar/…       # 增量模式下也会打补丁（模板遗留）
-```
-
-`updateBuild(version, hotUrl, diffUrl)`：
-
-1. 创建 `build_<version>` 目录
-2. 有 `diffUrl`：下载 `diff.zip` → 解压 → 用 `bspatch` 基于旧版 `work.asar`、`send.asar` 打补丁 → 校验 `work.asar/index.html`
-3. 增量失败且有 `hotUrl`：下载 `hot.zip` → 解压
-4. 校验 `work.asar` 存在 → 写 `upgrade.json` → 删除其它 `build_*` 目录
-5. **不会自动重启**，前端需自行调用 `appRestart()`
-
-`getBuildPath()`（启动时调用）：
-
-- 读取 `upgrade.json`；若记录的 `appVersion` 与当前壳版本不同（用户重装了新壳），或 `work.asar/index.html` 不存在，则删除 `upgrade.json`，回退到内置 `<app>/build`
-- 结果缓存于 `global.upgrade`
-
-### 4.7 定时任务（`src/utils/autoImportTask.js`）
-
-- 任务结构：`{auto_import_id, intervals(秒), data}`
-- `addOrUpdateTask`：间隔不变仅更新 `data`，间隔变化则重建 `setInterval`
-- `cleanUp(list)`：删除不在列表中的任务
-- `queryNextInvocations()` → `[{auto_import_id, nextInvocations}]`
-- 触发时通过窗口级回调发送 `autoImport` 事件（窗口重建时回调会被替换）
-
-### 4.8 本地脚本执行服务（`src/utils/newElectronServer.js`）
-
-- 启动时监听随机地址：Windows `\\.\pipe\myapp-<uuid>`，其他系统 `$TMPDIR/socket_<uuid>.sock`
-- 地址 Base64 后写入 `global.ELECTRON_PIPE`、`process.env.ELECTRON_PIPE`（子进程可继承）
-- 协议：客户端发送 `{"action":"execute","data":{"file","args","option"}}`
-- 按扩展名选择解释器（`langCommandMap`：php/node/python/python3/bash/go/lua/ruby/rustc/cmd/powershell），用 `shell-env` 取登录 shell 的 `PATH` 后 `execSync`
-- Windows 非 js 脚本输出按 `cp936`(GBK) 解码
-- 响应：`{"status":"success","result":...}\n\n` 或 `{"status":"error","message":...}\n\n`
-
-### 4.9 userData 中的持久化文件
-
-| 文件 | 用途 |
+| 编号 | 需求 |
 |------|------|
-| `window-size.json` | 窗口位置尺寸 |
-| `close-cfg.json` | Windows 关闭行为（`isTray`、`noPrompt`），`utils.saveCloseCfg` 负责写入 |
-| `upgrade/upgrade.json` | 当前生效的热更新版本 |
-| `upgrade/build_<ver>/` | 热更新前端文件 |
+| FR-PRT-1 | 应用 ready 前以 `standard`、`secure`、`supportFetchAPI`、`stream`、`corsEnabled` 权限注册 `chttp` 为特权协议；ready 后用 `protocol.handle` 处理 |
+| FR-PRT-2 | 仅接受主机名 `app`，其他主机返回 `404` |
+| FR-PRT-3 | 路径以 `/api/` 开头的请求交给 Router（5.3）；其余为静态资源 |
+| FR-PRT-4 | 静态资源：按扩展名返回正确 `Content-Type`（至少 html/js/mjs/css/json/svg/png/jpg/webp/ico/woff/woff2/wasm/map） |
+| FR-PRT-5 | 静态资源：无扩展名且文件不存在的路径回落 `index.html`（SPA）；`index.html` 带 `Cache-Control: no-cache` |
+| FR-PRT-6 | 静态资源：解码后路径必须位于资源根目录内，越界（`..`、绝对路径、编码绕过）返回 `403` |
+| FR-PRT-7 | 开发模式：静态资源请求转发到 renderer dev server，保证前端 origin 始终为 `chttp://app` |
+| FR-PRT-8 | 所有响应附带 CSP（默认 `default-src 'self'`，开发模式允许 dev server 的 HMR 连接） |
+| FR-PRT-9 | 不再全局注入 CORS 头；`chttp://app` 页面与 `/api` 同源，无需 CORS |
 
----
+### 5.3 路由（虚拟 HTTP Server）（RTE）
 
-## 5. 定制入口
+对开发者暴露的 API（示意，具体签名在技术设计中定稿）：
 
-| 需求 | 修改位置 |
-|------|----------|
-| 应用名 / appId / 版本 / 版权 | `package.json` → `name`、`productName`、`build.appId`、`version`、`copyright` |
-| 图标 | `icon/app.icns`、`app.ico`、`app.png`(256×256) |
-| 托盘提示与菜单 | `src/main.js` → `createTray()` |
-| 窗口尺寸 | `src/main.js` → `createWindow()` |
-| RPC 方法 | `src/utils/protocol.js` → `handlers` |
-| 支持语言 | `build3.sh` → `validate_lang()` |
-| 脚本语言 | `src/utils/newElectronServer.js` → `langCommandMap` 与 `switch(ext)` |
-| 前端 | `build/work.asar/`，需在页面设置 `window.__APP_VERSION__`、`window.__BUILD_DATE__` |
+```ts
+const router = createRouter();
 
----
-
-## 6. 代码审查发现
-
-以下为阅读源码时发现的问题，按影响程度排序，供后续迭代参考（本次未修改代码）。
-
-### 6.1 安全相关（作为模板需明确告知使用者）
-
-1. **全局忽略证书校验**：`setCertificateVerifyProc` 恒返回 `0`，所有 HTTPS 中间人攻击都不会被拦截（`src/main.js`）。
-2. **本地脚本服务存在命令注入**：`newElectronServer.js` 用字符串拼接 `file`/`args` 后 `execSync`，且 socket 无任何认证；能连到该管道的本机进程（或继承了 `ELECTRON_PIPE` 的子进程）可执行任意命令。
-3. **`callFunction` 使用 `vm` 执行前端传入代码**：Node `vm` 不是安全边界，可逃逸到主进程。
-4. **`sendMessage` / `onMessage` 暴露任意 IPC 通道**，削弱了 contextBridge 的隔离意义。
-5. **CORS 全放开**：所有无 CORS 头的响应被注入 `Access-Control-Allow-Origin: *`。
-6. `apt://fetch`、`api://` 可代理任意地址，前端一旦被 XSS 即可借壳访问内网。
-
-### 6.2 功能缺陷
-
-1. **`app://` 的 Content-Type 永远不生效**：`getExt` 返回不带点的扩展名（如 `js`），而 `mimeTypes` 的键带点（`.js`），导致映射失败；同时无扩展名时又被设为 `".html"`，与其他分支不一致。`if (filePath || ...)` 恒为真，`error: -6` 分支不可达。
-2. **增量更新成功但未传 `hotUrl` 时返回错误**：`updateBuild` 中 `else if (!hot_url) return "hotUrl is require"` 未判断 `isBuildOk`，diff 已成功也会失败返回。
-3. **`bspatch` 路径与打包位置不一致**：代码在 `__dirname/extraResources` 查找（即 `resources/app/extraResources`），而 electron-builder 把 `extraResources` 放到 `resources/extraResources`（`process.resourcesPath`），打包后增量更新大概率失败、回落全量。
-4. **增量更新还会 patch `send.asar`**：模板中并不存在该文件，属于原产品遗留，导致 diff 必然失败。
-5. **未知长度下载进度公式错误**：`(((100 * cur) / 500) * 1024 * 1024)` 应为 `100 * cur / (500 * 1024 * 1024)`。
-6. `upgrade.js` 中 `ret` 未声明即赋值（隐式全局变量）。
-7. 关闭延时注释写 3 秒，实际为 500ms；前端处理窗口很短。
-8. `api://` 把响应体按 `text()` 读取，二进制内容会损坏。
-9. `README` 描述热更新后"App restarts"，实际需要前端手动调用 `appRestart()`。
-
-### 6.3 工程化
-
-1. 无测试、无 lint、无 CI 配置。
-2. `build3.sh` 依赖 `yarn`、全局 `asar` CLI，二者都不在 devDependencies 中；`mv index.html ./dist/` 在 `dist/` 不存在时会失败；`find -maxdepth` 位置会产生 GNU find 警告。
-3. `getQueryParams`、`getMimeTypeByExt`、`PromiseQueue`、`getLastBase`、`saveCloseCfg` 已导出但未被使用（`saveCloseCfg` 缺少对应 IPC 通道）。
-4. `.specify/memory/constitution.md` 仍是未填写的模板。
-
----
-
-## 7. 快速上手
-
-```bash
-npm install
-# 放入前端产物：build/work.asar/index.html（需设置 window.__APP_VERSION__）
-npm run dev                       # 开发调试（加 -dev 参数可自动打开 DevTools）
-npm start                         # 加载 http://localhost:3000 的前端 dev server
-npm run build                     # 生产构建
-./build3.sh -p mac -a arm -s      # 打包并签名 macOS arm64
+router.get("/api/ping", async (req) => ({ ok: true }));          // 返回对象 → 200 JSON
+router.post("/api/items/:id", async (req) => {
+  const body = await req.json<{ name: string }>();
+  return json({ id: req.params.id, ...body }, { status: 201 });
+});
+router.sse("/api/progress", async (req, sse) => {                  // SSE
+  sse.send({ percent: 10 }, { event: "progress", id: "1" });
+  sse.onClose(() => {/* 客户端断开时清理 */});
+  sse.close();
+});
 ```
+
+| 编号 | 需求 |
+|------|------|
+| FR-RTE-1 | 支持 GET/POST/PUT/PATCH/DELETE/OPTIONS/HEAD；路径参数 `:id`；query 解析 |
+| FR-RTE-2 | 请求对象提供 `method`、`path`、`params`、`query`、`headers`、`json()`、`text()`、`arrayBuffer()` |
+| FR-RTE-3 | handler 可返回 `Response`、普通对象（序列化为 JSON）或 `undefined`（`204`） |
+| FR-RTE-4 | 使用标准 HTTP 状态码；未匹配路由 `404`，方法不支持 `405`，handler 抛错 `500`（生产不返回堆栈） |
+| FR-RTE-5 | 支持中间件（至少：日志、错误处理、请求体大小限制） |
+| FR-RTE-6 | 路由注册冲突时启动失败并给出明确报错 |
+| FR-RTE-7 | 只接受来自本应用页面的请求（校验请求来源为 `chttp://app`），其他来源 `403` |
+
+### 5.4 SSE（SSE）
+
+| 编号 | 需求 |
+|------|------|
+| FR-SSE-1 | 响应头 `Content-Type: text/event-stream`、`Cache-Control: no-cache`，响应体为 `ReadableStream` |
+| FR-SSE-2 | `send(data, { event?, id?, retry? })`，对象自动 JSON 序列化，多行数据按规范拆分 `data:` 行 |
+| FR-SSE-3 | 客户端断开（流被取消）时触发 `onClose`，handler 能停止后续工作 |
+| FR-SSE-4 | 支持可选的心跳注释帧（如每 15s 一次 `: ping`） |
+| FR-SSE-5 | 渲染进程能以 `fetch` + 流读取方式消费；**`EventSource` 是否可用需在 M2 验证**，不可用则提供轻量客户端封装 |
+
+### 5.5 插件（动态加载路由模块）（PLG）
+
+| 编号 | 需求 |
+|------|------|
+| FR-PLG-1 | 插件源码位于仓库 `plugins/<name>/index.ts`，构建时编译并随安装包放入 `resources/plugins/<name>/` |
+| FR-PLG-2 | 启动时扫描该目录并加载；**不读取 userData 等任何用户可写目录** |
+| FR-PLG-3 | 插件导出约定：`export default definePlugin({ name, version, setup(router, ctx) })` |
+| FR-PLG-4 | 插件路由自动挂载到 `/api/plugins/<name>/*`，不能注册该前缀以外的路由 |
+| FR-PLG-5 | 单个插件加载或 `setup` 失败只记录日志并跳过，不影响应用和其他插件 |
+| FR-PLG-6 | 提供 `GET /api/plugins` 返回已加载插件列表与状态 |
+| FR-PLG-7 | `ctx` 只暴露受控能力（日志、配置读取、userData 下的插件私有目录），不直接暴露 `BrowserWindow` |
+
+### 5.6 窗口、托盘、单实例（WIN）
+
+| 编号 | 需求 |
+|------|------|
+| FR-WIN-1 | 单实例；第二实例启动时恢复并聚焦主窗口 |
+| FR-WIN-2 | 无边框窗口（`titleBarStyle: hidden`），最小 960×640；记住窗口位置、尺寸、最大化状态，恢复时确保窗口在可见屏幕内 |
+| FR-WIN-3 | 托盘：单击显示主窗口；菜单"显示主窗口""退出" |
+| FR-WIN-4 | 关闭行为：用户可选"最小化到托盘"或"退出"，可记住选择；由前端弹窗决策（交互细节见 Q4） |
+| FR-WIN-5 | 外部链接（`window.open`、`target=_blank`）只允许 http/https，用系统浏览器打开；禁止主窗口导航离开 `chttp://app` |
+| FR-WIN-6 | 右键菜单：复制/全选，可编辑区域增加剪切/粘贴 |
+| FR-WIN-7 | 跟随系统深色模式，变化时推送给前端 |
+
+### 5.7 IPC 与 preload（IPC）
+
+| 编号 | 需求 |
+|------|------|
+| FR-IPC-1 | 通道名与参数类型在 `src/shared/ipc.ts` 统一定义，main 与 preload 共用类型 |
+| FR-IPC-2 | preload 只暴露白名单方法，不提供通用 `send`/`on` |
+| FR-IPC-3 | 主进程处理每个调用时校验发送方 frame 的 origin 为 `chttp://app`，并校验参数 |
+| FR-IPC-4 | 保留的调用：窗口控制（最小化、最大化切换、隐藏、显示、关闭、强制关闭/退出、取消关闭）、DevTools（仅开发模式）、获取版本与平台信息、获取系统语言、打开外部链接 |
+| FR-IPC-5 | 主进程推送事件（白名单）：`window:close-requested`、`theme:changed`、`autoImport:tick` |
+| FR-IPC-6 | 其余旧 IPC 能力的去留见 Q3 |
+
+### 5.8 AutoImport 定时任务（TSK）
+
+| 编号 | 需求 |
+|------|------|
+| FR-TSK-1 | 任务结构 `{ id: string; intervalSec: number; data: unknown }`，`intervalSec` 下限 10s（可配置） |
+| FR-TSK-2 | 同步接口：前端提交完整任务列表，新增/更新/删除一次完成（替代旧的 add + cleanUp） |
+| FR-TSK-3 | 间隔不变只更新 `data`，不重置计时；间隔变化则重新计时 |
+| FR-TSK-4 | 查询接口返回每个任务的下次执行时间 |
+| FR-TSK-5 | 到期时向主窗口推送 `autoImport:tick`；窗口隐藏时照常推送，窗口销毁重建后继续推送到新窗口 |
+| FR-TSK-6 | 任务管理接口改为 HTTP：`PUT /api/tasks`、`GET /api/tasks` |
+
+---
+
+## 6. 非功能需求
+
+### 6.1 安全（SEC）
+
+| 编号 | 需求 |
+|------|------|
+| SEC-1 | `contextIsolation: true`、`sandbox: true`、`nodeIntegration: false`、`webSecurity: true` |
+| SEC-2 | 移除 `setCertificateVerifyProc` 忽略证书错误、`RejectUnauthorized` 请求头、全局 CORS 注入 |
+| SEC-3 | 默认拒绝所有权限请求（摄像头、通知等），需要时按白名单放行 |
+| SEC-4 | 禁止加载远程内容到主窗口；禁止 `webview` |
+| SEC-5 | 启用 Fuses 与 asar 完整性校验（见 FR-BLD-5） |
+| SEC-6 | 安装包与主程序均签名（见第 7 节） |
+| SEC-7 | 依赖审计：CI 中运行 `npm audit --omit=dev`（high 及以上为失败） |
+
+### 6.2 性能
+
+| 编号 | 需求 |
+|------|------|
+| PERF-1 | 冷启动到首屏可交互 ≤ 2s（参考机器在 M1 确定基线） |
+| PERF-2 | `/api` 空路由往返延迟 P95 ≤ 5ms |
+| PERF-3 | 单个 SSE 连接持续推送 10 分钟内存无持续增长 |
+
+### 6.3 质量
+
+| 编号 | 需求 |
+|------|------|
+| QA-1 | Router、SSE 编码、静态路径校验、AutoImport 调度单元测试覆盖率 ≥ 80% |
+| QA-2 | 使用 Playwright（Electron 模式）做 E2E：启动、加载首页、调用 `/api/ping`、接收 SSE、窗口控制 |
+| QA-3 | ESLint + Prettier，CI 强制 |
+
+---
+
+## 7. 打包与签名方案（Windows x64 + Inno Setup）
+
+### 7.1 打包流程
+
+```
+electron-forge package   →   out/<App>-win32-x64/        （Forge 打包，含 asar、Fuses）
+        │
+        ├─ 签名：主程序 exe 及其他 PE 文件（@electron/windows-sign，经统一签名钩子）
+        ▼
+electron-forge make      →   自定义 Inno maker：生成 .iss → 调用 ISCC.exe
+        │
+        ├─ 签名：安装程序与卸载程序（Inno 的 SignTool 指令，调用同一签名钩子）
+        ▼
+out/make/<App>_x64_<version>_setup.exe
+```
+
+| 编号 | 需求 |
+|------|------|
+| PKG-1 | Forge 没有官方 Inno maker，在仓库内实现自定义 maker（`forge/maker-inno.ts`），基于 `MakerBase`，从模板生成 `.iss` 并调用 `ISCC.exe` |
+| PKG-2 | 构建机为 Windows，预装 Inno Setup 6；ISCC 路径可通过环境变量覆盖 |
+| PKG-3 | `.iss` 中 `AppId` 为固定 GUID（保证覆盖升级）；版本号取自 `package.json`；含开始菜单、可选桌面快捷方式、卸载项 |
+| PKG-4 | 升级安装前关闭正在运行的应用（Inno `CloseApplications`） |
+| PKG-5 | 产物命名：`<productName>_x64_<version>_setup.exe` |
+
+### 7.2 签名方案
+
+**前提**：自 2023 年 6 月起，OV/EV 代码签名证书的私钥必须存放在 HSM 或云 HSM 中，不能再以 `.pfx` 文件放在构建机上。因此方案统一为"**签名钩子 + 可替换的签名后端**"。
+
+**统一签名钩子** `scripts/sign-windows.ts`：
+
+- 输入：待签名文件路径
+- 行为：调用所选后端完成 Authenticode 签名（SHA-256）并加 RFC 3161 时间戳，然后执行 `signtool verify /pa` 校验
+- 调用方：① `@electron/windows-sign`（签 `out/` 中的 exe/dll）；② Inno `SignTool=` 指令（签安装与卸载程序）
+- 凭据：只从 CI 环境变量/密钥库读取，不进仓库
+- 开关：未配置凭据时跳过签名并输出警告（本地开发可正常 make）
+
+**签名后端选项**（三选一，见 Q1）：
+
+| 后端 | 说明 | 优点 | 注意 |
+|------|------|------|------|
+| A. 现有远程签名服务 | 沿用 `WIN_SIGN_URL`：上传文件、取回签名后文件 | 零采购成本，延续现有流程 | 需服务端支持时间戳，并返回可校验结果；建议加鉴权，并改为按签名校验结果判断成功，而不是按文件大小 |
+| B. Azure Trusted Signing（微软云签名） | `signtool` + 微软提供的 dlib 插件 | 费用低、无需管理证书、可直接接入 CI | 对申请主体有资格限制，需先确认公司能否开通 |
+| C. 云 HSM 托管的 OV/EV 证书 | DigiCert KeyLocker、SSL.com eSigner 等，`signtool` 或 `jsign` 调用 | 证书主体就是公司名称，通用性强 | 年费较高；EV 证书已不再立即获得 SmartScreen 信誉 |
+
+**建议**：如果远程签名服务（A）仍在维护并且符合上述要求，本期直接用 A；否则优先评估 B。
+
+---
+
+## 8. 移除与迁移清单
+
+| 旧能力 | 处置 | 前端迁移 |
+|--------|------|----------|
+| `app://localhost` | 由 `chttp://app/` 替代 | 改加载地址 |
+| `api://` 反向代理 | 删除 | 需要访问外部接口时由主进程路由/插件实现 |
+| `apt://<method>` | 由 `chttp://app/api/*` 替代 | 改 URL；返回格式从 `{code,msg,data}` 改为 HTTP 状态码 + JSON（见 Q2） |
+| `apt://download`（带进度下载） | 删除；如需保留则改写为内置 SSE 路由（见 Q3） | — |
+| `callFunction`、`fetch` 代理 | 删除 | — |
+| 热更新、`checkUpdate` 定时推送 | 删除 | 删除前端相关逻辑 |
+| 本地脚本执行服务 `ELECTRON_PIPE` | 删除 | — |
+| `setRedirect` 一次性重定向 | 见 Q3 | — |
+| `window.app.sendMessage/onMessage` | 删除，改为白名单方法 | 改调用方式 |
+| `initRegion` / `-region` 启动参数 | 删除 | 改用系统语言 |
+| mac/linux 代码分支 | 删除 | — |
+
+> 注意：移除全局 CORS 注入后，前端**不能再直接请求未开放 CORS 的第三方接口**，此类请求必须改为调用主进程路由或插件。
+
+---
+
+## 9. 里程碑与验收
+
+| 里程碑 | 内容 | 验收标准 |
+|--------|------|----------|
+| M1 工程骨架 | Forge + TS + 最新 Electron；窗口、托盘、单实例；lint/typecheck/test/CI | Windows 上 `npm start` 正常启动；CI 全绿 |
+| M2 chttp 核心 | 静态资源、Router、SSE、开发模式代理 | FR-PRT、FR-RTE、FR-SSE 全部测试通过；E2E 能调用 `/api/ping` 并收到 SSE；完成 `EventSource` 验证 |
+| M3 插件与业务 | 插件加载、AutoImport、白名单 IPC | 示例插件 `plugins/hello` 可访问；单个插件故障不影响启动；FR-TSK 测试通过 |
+| M4 发布 | 安全加固、Fuses、Inno maker、签名钩子 | 安装、升级覆盖、卸载正常；`signtool verify /pa` 通过；SEC 清单逐项核对通过 |
+
+---
+
+## 10. 待确认事项
+
+以下事项会影响实现。表中只给出建议，确认前不按建议默认执行。
+
+| # | 问题 | 建议 |
+|---|------|------|
+| Q1 | 签名后端选 A / B / C？远程签名服务是否仍在维护？ | A（若服务满足 7.2 的要求），否则 B |
+| Q2 | `/api` 返回格式：标准 HTTP 状态码 + JSON，还是沿用 `{code,msg,data}`？ | 标准状态码；错误体 `{ "error": { "code": "...", "message": "..." } }` |
+| Q3 | 下列旧 IPC/协议能力是否保留：`openFolder`、`openFile`（在文件夹中显示）、`install`（运行安装包）、`getRemoteText`、`setRedirect`、`download`（带进度）、各类系统路径查询、`doCrash` | 保留 `openFile`；`download` 改为 SSE 路由；`getRemoteText` 由插件按需实现；其余删除 |
+| Q4 | 关闭窗口交互：首次弹窗询问并可"记住选择"，还是固定最小化到托盘？ | 首次询问并记住，设置页可修改 |
+| Q5 | Inno 安装模式：按用户安装（AppData，无需管理员）还是按机器安装（Program Files，需管理员）？ | 按机器安装：插件目录位于用户无写权限的位置，才能满足 FR-PLG-2 的可信要求 |
+| Q6 | Forge 的 renderer 构建用 Vite 插件还是 Webpack 插件？模板是否内置示例前端？ | Vite；内置一个最小示例页面，用于演示 `/api` 和 SSE |
+| Q7 | 插件之间是否允许互相调用？插件是否需要读写配置？ | 本期不允许互相调用；只提供只读配置与私有目录 |
+| Q8 | 是否需要日志落盘及崩溃转储收集？ | 日志写入 `userData/logs` 并按大小轮转；崩溃转储仅保存在本地 |
+
+---
+
+## 附录 A：现状摘要（重构前）
+
+- 运行时：Electron 26，纯 JS，esbuild 构建产物 `main.js`/`preload.js`，electron-builder + `build3.sh` 多平台打包
+- 模块：`protocol.js`（app/api/apt 三协议）、`ipcInit.js`（约 35 个 IPC 通道）、`upgrade.js`（热更新）、`newElectronServer.js`（脚本执行）、`autoImportTask.js`（定时任务）、`utils.js`、`zip.js`
+- 已知缺陷（重构后随模块删除或改写而消失，此处仅作记录）：
+  - `app://` 的 MIME 映射因扩展名带不带点不一致而失效
+  - bspatch 查找路径与打包后实际位置不一致
+  - 增量补丁会处理不存在的 `send.asar`
+  - 只传增量包地址时，即使打补丁成功也会返回错误
+  - 未知文件长度时下载进度公式错误
+  - `upgrade.js` 中 `ret` 未声明即赋值
+  - 关闭延时注释写 3 秒，实际为 500ms
+  - 脚本执行服务存在命令注入
